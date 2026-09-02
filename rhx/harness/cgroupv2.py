@@ -160,6 +160,13 @@ class ReclaimResult:
     error: Optional[str]
     t_start_mono: float
     t_end_mono: float
+    # Proactive completion is one of: full, infeasible, error.  `wrote_ok` is
+    # true only for full completion; partial progress never becomes success.
+    outcome: str = "full"
+    attempts: int = 1
+    eagain_count: int = 0
+    progress_bytes: Optional[int] = None
+    progress_source: Optional[str] = None
     # B3: OOM safety. A nonzero delta here means the trial is INVALID.
     oom_kill_delta: int = 0
     oom_delta: int = 0
@@ -240,38 +247,139 @@ class Cgroup:
 
     # ---------- reclaim ----------
 
+    def _memory_stat_value(self, key: str) -> Optional[int]:
+        values = parse_keyed(_read_text(self.path / "memory.stat"), [key], "")
+        return values.get(key)
+
+    def _write_reclaim(self, arg: str) -> None:
+        """Perform one blocking write to memory.reclaim.
+
+        O_NONBLOCK is deliberately absent.  The payload is tiny, so a short
+        userspace write is an I/O error; EAGAIN here is the kernel's documented
+        signal that this reclaim request made only partial progress.
+        """
+        payload = (arg + "\n").encode()
+        flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(self.path / "memory.reclaim", flags)
+        try:
+            written = os.write(fd, payload)
+        finally:
+            os.close(fd)
+        if written != len(payload):
+            raise OSError(errno.EIO,
+                          f"short memory.reclaim write: {written}/{len(payload)}")
+
     def reclaim_proactive(self, nbytes: int, swappiness: Optional[int] = None) -> ReclaimResult:
         """Mode A. Write to memory.reclaim.
 
         NOTE: per kernel docs this is NOT accounted as pressure on the cgroup.
         Use only for page-dynamics measurements.
 
-        The kernel returns EAGAIN if it could not reclaim the full amount; this
-        is captured rather than raised, because partial reclaim is informative.
+        The kernel returns EAGAIN if it could not reclaim the full amount.  A
+        partial attempt is measured using the cgroup's pgsteal counter (falling
+        back to memory.current only if pgsteal is unavailable), and only the
+        remaining amount is retried.  Two consecutive EAGAIN attempts with no
+        reclaim progress are a distinct `infeasible` outcome: the kernel has
+        exhausted its own retries twice without finding another reclaimable
+        page.  Other write failures are `error` outcomes.
         """
+        requested = int(nbytes)
+        if requested <= 0:
+            raise ValueError("proactive reclaim requires a positive byte count")
+
         before = self.memory_current()
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        last_pgsteal = self._memory_stat_value("pgsteal")
+        last_current = before
         t0 = time.monotonic()
-        arg = str(int(nbytes))
-        if swappiness is not None:
-            # Supported on newer kernels only; failure is recorded, not fatal.
-            arg += f" swappiness={int(swappiness)}"
-        ok, err = True, None
-        try:
-            (self.path / "memory.reclaim").write_text(arg + "\n")
-        except OSError as e:
-            ok = False
-            err = f"{type(e).__name__}: errno={e.errno} {e.strerror}"
-            if swappiness is not None:
-                # retry without the extra token, which older kernels reject
-                try:
-                    (self.path / "memory.reclaim").write_text(str(int(nbytes)) + "\n")
-                    ok, err = True, "retried_without_swappiness"
-                except OSError as e2:
-                    err = f"{err}; retry: errno={e2.errno} {e2.strerror}"
+        remaining = requested
+        attempts = 0
+        eagain_count = 0
+        no_progress = 0
+        outcome = "error"
+        err = None
+        progress_source = None
+        active_swappiness = swappiness
+
+        while remaining > 0:
+            attempts += 1
+            arg = str(remaining)
+            if active_swappiness is not None:
+                arg += f" swappiness={int(active_swappiness)}"
+            try:
+                self._write_reclaim(arg)
+            except OSError as e:
+                # Older kernels reject the swappiness nested key before doing
+                # reclaim.  Do not retry without it for EAGAIN: that could
+                # double-count a partial reclaim from the first write.
+                unsupported = (errno.EINVAL, getattr(errno, "EOPNOTSUPP", -1))
+                if active_swappiness is not None and e.errno in unsupported:
+                    active_swappiness = None
+                    continue
+
+                current = self.memory_current()
+                pgsteal = self._memory_stat_value("pgsteal")
+                progress = None
+                if pgsteal is not None and last_pgsteal is not None:
+                    progress = max(0, pgsteal - last_pgsteal) * page_size
+                    progress_source = "memory.stat:pgsteal"
+                elif current is not None and last_current is not None:
+                    progress = max(0, last_current - current)
+                    progress_source = "memory.current"
+
+                last_pgsteal = pgsteal
+                last_current = current
+
+                if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    err = f"{type(e).__name__}: errno={e.errno} {e.strerror}"
+                    outcome = "error"
+                    break
+
+                eagain_count += 1
+                if progress is None:
+                    err = ("EAGAIN after partial reclaim, but neither pgsteal "
+                           "nor memory.current was readable; remaining amount "
+                           "cannot be determined without fabrication")
+                    outcome = "error"
+                    break
+
+                credited = min(progress, remaining)
+                remaining -= credited
+                if remaining == 0:
+                    # EAGAIN means this individual write reclaimed less than it
+                    # requested.  Counter activity from elsewhere must not turn
+                    # that kernel failure into a claimed full success.
+                    err = ("EAGAIN conflicted with counters indicating full "
+                           "progress; refusing to infer successful completion")
+                    outcome = "error"
+                    break
+
+                if credited:
+                    no_progress = 0
+                else:
+                    no_progress += 1
+                    if no_progress >= 2:
+                        outcome = "infeasible"
+                        err = (f"EAGAIN with no reclaim progress on {no_progress} "
+                               f"consecutive retries; {remaining} bytes remain")
+                        break
+                continue
+            else:
+                remaining = 0
+                outcome = "full"
+                err = None
+                break
+
         t1 = time.monotonic()
         after = self.memory_current()
         delta = (before - after) if (before is not None and after is not None) else None
-        return ReclaimResult("proactive", int(nbytes), before, after, delta, ok, err, t0, t1)
+        return ReclaimResult(
+            "proactive", requested, before, after, delta,
+            outcome == "full", err, t0, t1,
+            outcome=outcome, attempts=attempts, eagain_count=eagain_count,
+            progress_bytes=requested - remaining,
+            progress_source=progress_source,
+        )
 
     def _oom_counters(self) -> Dict[str, int]:
         ev = parse_keyed(_read_text(self.path / "memory.events"),
@@ -319,6 +427,7 @@ class Cgroup:
 
         res = ReclaimResult(
             "natural", int(target_bytes), before, after, delta, ok, err, t0, t1,
+            outcome="full" if ok else "error",
             oom_kill_delta=oom_after["oom_kill"] - oom_before["oom_kill"],
             oom_delta=oom_after["oom"] - oom_before["oom"],
             workload_survived=survived,

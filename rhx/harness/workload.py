@@ -83,7 +83,8 @@ class Workload:
 
     # ---------------- lifecycle ----------------
 
-    def start(self, duration_s: Optional[float] = None, report_s: float = 0.0) -> int:
+    def start(self, duration_s: Optional[float] = None, report_s: float = 0.0,
+              cgroup_procs: Optional[Path] = None) -> int:
         argv = [str(self.binary),
                 "--backing", self.backing,
                 "--pages", str(self.n_pages),
@@ -100,8 +101,24 @@ class Workload:
         if self.prefault:
             argv += ["--prefault"]
 
+        launch_argv = argv
+        if cgroup_procs is not None:
+            cgroup_procs = Path(cgroup_procs)
+            if not cgroup_procs.exists():
+                raise WorkloadError(f"cgroup.procs does not exist: {cgroup_procs}")
+            # Join the target cgroup in the wrapper process, then exec rategen
+            # with the same PID.  No rategen initialization can occur before
+            # the join, so FILE materialization and both FILE/ANON prefaults are
+            # charged to the experimental cgroup from their first page.
+            launch_argv = [
+                "/bin/sh", "-c",
+                'printf "0\\n" > "$1" || exit 126; shift; exec "$@"',
+                "rhx-cgroup-launch", str(cgroup_procs), *argv,
+            ]
+
         errf = open(self.err_path, "w")
-        self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=errf)
+        self.proc = subprocess.Popen(
+            launch_argv, stdout=subprocess.DEVNULL, stderr=errf)
 
         # Wait for the FIFO to appear and the process to announce readiness.
         deadline = time.monotonic() + 30.0

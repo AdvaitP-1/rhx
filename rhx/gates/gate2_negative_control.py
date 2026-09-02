@@ -31,6 +31,7 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -65,17 +66,25 @@ def run_arm(name: str, out: Path, args, spec: RateSpec) -> dict:
                   n_pages=args.pages, seed=args.seed, rate_spec=spec,
                   backing=args.backing, prefault=True)
     total_s = args.measure_s + args.n_reclaims * (args.interval_s + 5.0) + 60.0
-    pid = wl.start(duration_s=total_s, report_s=60.0)
-    print(f"[{name}] workload pid={pid}")
 
     cg = None
     tel = None
     result = {"arm": name, "rate_spec": spec.as_dict()}
     try:
+        # Charge the mapping to this arm's cgroup from initial materialization
+        # and prefault, rather than migrating the process after those charges.
         if cgroup_v2_available():
             cg = Cgroup(f"{args.cgroup_name}_{name}")
             cg.create()
-            cg.add_pid(pid)
+
+        pid = wl.start(
+            duration_s=total_s, report_s=60.0,
+            cgroup_procs=(cg.path / "cgroup.procs") if cg is not None else None,
+        )
+        print(f"[{name}] workload pid={pid}")
+        if cg is not None and pid not in cg.procs():
+            raise RuntimeError(
+                f"workload pid {pid} was not launched in cgroup {cg.path}")
 
         tel = Telemetry(cg, arm_dir / "telemetry", interval_s=1.0 / args.telemetry_hz)
         tel.start()
@@ -110,6 +119,7 @@ def run_arm(name: str, out: Path, args, spec: RateSpec) -> dict:
         reclaim_bytes = int(args.pages * args.victim_frac) * page_size
         marginal_rates = []
         victim_counts = []
+        reclaim_records = []
         for i in range(args.n_reclaims):
             wl.pause()                       # B4
             snap_a = wl.snapshot_residency(f"{name}_pre{i}")
@@ -125,15 +135,33 @@ def run_arm(name: str, out: Path, args, spec: RateSpec) -> dict:
                     if getattr(rec, "oom_kill_delta", 0) > 0:
                         raise RuntimeError(
                             f"OOM kill during reclaim {i}; trial invalid")
+                reclaim_info = asdict(rec)
+                reclaim_info["duration_s"] = rec.duration_s
+                reclaim_records.append(reclaim_info)
                 tel.event("reclaim_end", iteration=i,
                           actual_delta_bytes=rec.actual_delta_bytes,
-                          wrote_ok=rec.wrote_ok, error=rec.error)
+                          wrote_ok=rec.wrote_ok, outcome=rec.outcome,
+                          attempts=rec.attempts, eagain_count=rec.eagain_count,
+                          progress_bytes=rec.progress_bytes,
+                          progress_source=rec.progress_source,
+                          error=rec.error)
             snap_b = wl.snapshot_residency(f"{name}_post{i}")
             rb = parse_residency(snap_b)
             wl.resume()                      # B4
             victims = ra["resident"] & (~rb["resident"])
             nv = int(victims.sum())
             victim_counts.append(nv)
+            if (cg is not None and args.reclaim_mode == "proactive" and
+                    not rec.wrote_ok):
+                result["invalid"] = "reclaim_incomplete"
+                result["reclaims"] = reclaim_records
+                result["victim_counts"] = victim_counts
+                result["marginal_victim_rates"] = marginal_rates
+                print(f"[{name}] TRIAL INVALID: proactive reclaim "
+                      f"outcome={rec.outcome}, completed "
+                      f"{rec.progress_bytes}/{rec.requested_bytes} bytes, "
+                      f"measured victims={nv}")
+                return result
             if nv > 0:
                 mr = float(lam_true[victims].mean())
             else:
@@ -145,6 +173,7 @@ def run_arm(name: str, out: Path, args, spec: RateSpec) -> dict:
 
         result["victim_counts"] = victim_counts
         result["marginal_victim_rates"] = marginal_rates
+        result["reclaims"] = reclaim_records
 
         valid = [r for r in marginal_rates if np.isfinite(r)]
         if len(valid) >= 2 and valid[0] > 0:

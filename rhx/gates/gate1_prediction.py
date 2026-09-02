@@ -33,6 +33,7 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -113,18 +114,27 @@ def main() -> int:
                   n_pages=args.pages, seed=args.seed, rate_spec=spec,
                   backing=args.backing, prefault=True)
     total_s = args.measure_s + args.window_T + 120.0
-    pid = wl.start(duration_s=total_s, report_s=60.0)
-    print(f"workload pid={pid} pages={args.pages}")
 
     cg = None
     tel = None
     try:
-        # ---------------- cgroup ----------------
+        # Create the cgroup before launch.  Workload.start uses a wrapper that
+        # joins this cgroup before exec, so rategen materializes and prefaults
+        # the measured mapping with correct charge ownership from page one.
         if cgroup_v2_available():
             cg = Cgroup(args.cgroup_name)
             cg.create()
-            cg.add_pid(pid)
-            print(f"cgroup {cg.path} created, workload moved in")
+
+        pid = wl.start(
+            duration_s=total_s, report_s=60.0,
+            cgroup_procs=(cg.path / "cgroup.procs") if cg is not None else None,
+        )
+        print(f"workload pid={pid} pages={args.pages}")
+        if cg is not None:
+            if pid not in cg.procs():
+                raise RuntimeError(
+                    f"workload pid {pid} was not launched in cgroup {cg.path}")
+            print(f"cgroup {cg.path} created, workload launched inside it")
 
         tel = Telemetry(cg, out / "telemetry", interval_s=1.0 / args.telemetry_hz)
         tel.start()
@@ -199,15 +209,11 @@ def main() -> int:
                                          watch_pid=pid)
             print(f"reclaim mode={rec.mode} requested={rec.requested_bytes} "
                   f"actual_delta={rec.actual_delta_bytes} ok={rec.wrote_ok} "
+                  f"outcome={rec.outcome} attempts={rec.attempts} "
                   f"err={rec.error}")
-            tel.event("reclaim_end", **{
-                "mode": rec.mode, "requested_bytes": rec.requested_bytes,
-                "memory_current_before": rec.memory_current_before,
-                "memory_current_after": rec.memory_current_after,
-                "actual_delta_bytes": rec.actual_delta_bytes,
-                "wrote_ok": rec.wrote_ok, "error": rec.error,
-                "duration_s": rec.duration_s,
-            })
+            reclaim_info = asdict(rec)
+            reclaim_info["duration_s"] = rec.duration_s
+            tel.event("reclaim_end", **reclaim_info)
         else:
             print("no cgroup available; skipping reclaim (development run)")
             tel.event("reclaim_skipped", reason="no cgroup")
@@ -216,6 +222,28 @@ def main() -> int:
         snap_post = wl.snapshot_residency("post_reclaim")
         r_post = parse_residency(snap_post)
         wl.resume()          # recovery must proceed under normal access
+
+        # A partial proactive reclaim does not match the pre-registered victim
+        # fraction.  Preserve its measured residency and reclaim accounting,
+        # but invalidate the trial instead of scoring it as a smaller success.
+        if (rec is not None and args.reclaim_mode == "proactive" and
+                not rec.wrote_ok):
+            partial_victims = r_pre["resident"] & (~r_post["resident"])
+            partial_n = int(partial_victims.sum())
+            print(f"\nTRIAL INVALID: proactive reclaim outcome={rec.outcome}; "
+                  f"{rec.progress_bytes}/{rec.requested_bytes} bytes completed, "
+                  f"measured victims={partial_n}.")
+            reclaim_info = asdict(rec)
+            reclaim_info["duration_s"] = rec.duration_s
+            (out / "gate1_results.json").write_text(json.dumps({
+                "gate": 1,
+                "invalid": "reclaim_incomplete",
+                "reclaim": reclaim_info,
+                "pre_resident_frac": float(r_pre["resident"].mean()),
+                "post_resident_frac": float(r_post["resident"].mean()),
+                "n_victims": partial_n,
+            }, indent=2, default=str))
+            return 6
 
         # B3: an OOM kill invalidates the trial. Do not analyze it.
         if rec is not None and getattr(rec, "oom_kill_delta", 0) > 0:
