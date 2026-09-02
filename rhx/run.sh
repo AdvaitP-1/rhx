@@ -27,6 +27,10 @@ MEASURE_S="${MEASURE_S:-300}"
 WINDOW_T="${WINDOW_T:-60}"
 TRIALS="${TRIALS:-20}"
 MODE="${MODE:-proactive}"       # proactive | natural
+EXTRA_ARGS=()
+if [ -n "${EXTRA:-}" ]; then
+  read -r -a EXTRA_ARGS <<< "$EXTRA"
+fi
 
 build() {
   head_ "build"
@@ -84,7 +88,8 @@ gate0() {
   head_ "Gate 0 -- can we measure f(lambda)?  (${TRIALS} trials)"
   "$PY" run_trials.py --gate 0 --trials "$TRIALS" --out "$out" \
       --pages "$PAGES" --measure-s "$MEASURE_S" --window-T "$WINDOW_T" \
-      --dist gamma --p1 0.8 --p2 0.5 "${EXTRA:-}"
+      --dist gamma --p1 0.8 --p2 0.5 \
+      ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 }
 
 gate1() {
@@ -92,14 +97,15 @@ gate1() {
   head_ "Gate 1 -- pre-registered prediction test  (${TRIALS} trials, mode=${MODE})"
   "$PY" run_trials.py --gate 1 --trials "$TRIALS" --out "$out" \
       --reclaim-mode "$MODE" --pages "$PAGES" --measure-s "$MEASURE_S" \
-      --window-T "$WINDOW_T" "${EXTRA:-}"
+      --window-T "$WINDOW_T" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 }
 
 gate2() {
   local out="${1:-runs/gate2}"; build
   head_ "Gate 2 -- homogeneous negative control  (${TRIALS} trials, mode=${MODE})"
   "$PY" run_trials.py --gate 2 --trials "$TRIALS" --out "$out" \
-      --reclaim-mode "$MODE" --pages "$PAGES" --measure-s "$MEASURE_S" "${EXTRA:-}"
+      --reclaim-mode "$MODE" --pages "$PAGES" --measure-s "$MEASURE_S" \
+      ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 }
 
 case "${1:-help}" in
