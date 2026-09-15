@@ -48,15 +48,75 @@ def bootstrap_ci(x, n_boot=10000, alpha=0.05, seed=0):
             "n": int(len(x))}
 
 
+def manifest_exit_code(manifest) -> int:
+    """Fail if any trial or the gate's existing aggregate criterion failed."""
+    gate = manifest.get("gate")
+    trials = manifest.get("trials")
+    records = manifest.get("results", [])
+    if gate not in (0, 1, 2) or not isinstance(trials, int) or trials < 1:
+        return 1
+    if len(records) != trials:
+        return 1
+    if any(r.get("returncode") != 0 or
+           not isinstance(r.get("results"), dict) or
+           r["results"].get(f"gate{gate}_pass") is not True
+           for r in records):
+        return 1
+
+    agg = manifest.get("aggregate", {})
+    if agg.get("gate_pass") is not True:
+        return 1
+    if gate == 0:
+        for key in ("frozen_abs_err", "S_max_abs_err", "cv_rel_err", "q50_rel_err"):
+            try:
+                limit = records[0]["results"]["checks"][key]["limit"]
+                ci = agg[key]
+                if ci["n"] != trials or not np.isfinite(ci["hi"]) or ci["hi"] > limit:
+                    return 1
+            except (KeyError, TypeError, ValueError):
+                return 1
+        return 0
+    if gate == 1:
+        try:
+            ci = agg["ci"]
+            return 0 if (ci["n"] == trials and np.isfinite(ci["lo"])
+                         and ci["lo"] >= 0.90) else 1
+        except (KeyError, TypeError, ValueError):
+            return 1
+    try:
+        hom = agg["homogeneous"]
+        het = agg["heterogeneous"]
+        diff = agg["paired_difference"]
+        criteria = records[0]["results"]["pass_criteria"]
+        return 0 if (hom["n"] == trials and het["n"] == trials and
+                     diff["n"] == trials and np.isfinite(hom["hi"]) and
+                     np.isfinite(het["lo"]) and np.isfinite(diff["lo"]) and
+                     hom["hi"] <= criteria["homogeneous_amplification_max"] and
+                     het["lo"] >= criteria["heterogeneous_amplification_min"] and
+                     diff["lo"] > 0) else 1
+    except (KeyError, TypeError, ValueError):
+        return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Repeat a gate across trials")
-    ap.add_argument("--gate", type=int, required=True, choices=[0, 1, 2])
+    ap.add_argument("--gate", type=int, choices=[0, 1, 2])
     ap.add_argument("--trials", type=int, default=20)
-    ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--check-manifest", type=Path,
+                    help="check the exit verdict of an existing trials_manifest.json")
     ap.add_argument("--base-seed", type=int, default=20260503)
     ap.add_argument("--stop-on-invalid", action="store_true",
                     help="abort the whole run if any trial is invalidated")
     args, passthrough = ap.parse_known_args()
+
+    if args.check_manifest is not None:
+        manifest = json.loads(args.check_manifest.read_text())
+        rc = manifest_exit_code(manifest)
+        print(f"manifest verdict: {'PASS' if rc == 0 else 'FAIL'}")
+        return rc
+    if args.gate is None or args.out is None:
+        ap.error("--gate and --out are required unless --check-manifest is used")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -123,12 +183,18 @@ def main() -> int:
             print(f"\n  GATE 1 (aggregate): "
                   f"{'PASS' if agg['gate_pass'] else 'FAIL'}  "
                   f"(criterion: lower CI bound >= 0.90)")
+        else:
+            agg["gate_pass"] = False
 
     elif args.gate == 2:
-        hom = [r["results"]["arms"]["homogeneous"]["amplification_measured"]
-               for r in manifest["results"] if r.get("results")]
-        het = [r["results"]["arms"]["heterogeneous"]["amplification_measured"]
-               for r in manifest["results"] if r.get("results")]
+        arm_results = [r["results"]["arms"] for r in manifest["results"]
+                       if isinstance(r.get("results"), dict) and
+                       "arms" in r["results"] and
+                       all(name in r["results"]["arms"] and
+                           "amplification_measured" in r["results"]["arms"][name]
+                           for name in ("homogeneous", "heterogeneous"))]
+        hom = [arms["homogeneous"]["amplification_measured"] for arms in arm_results]
+        het = [arms["heterogeneous"]["amplification_measured"] for arms in arm_results]
         ci_h = bootstrap_ci(hom, seed=1)
         ci_e = bootstrap_ci(het, seed=2)
         agg = {"homogeneous": ci_h, "heterogeneous": ci_e,
@@ -151,24 +217,39 @@ def main() -> int:
                   f"{'PASS' if agg['gate_pass'] else 'FAIL'}")
             print("  criterion: homogeneous upper CI <= 1.10 AND paired "
                   "difference CI excludes 0")
+        else:
+            agg["gate_pass"] = False
+            print("\n  GATE 2 (aggregate): FAIL (fewer than 3 valid pairs)")
 
     elif args.gate == 0:
         keys = ["frozen_abs_err", "S_max_abs_err", "cv_rel_err", "q50_rel_err"]
         for kk in keys:
             vals = [r["results"]["checks"][kk]["value"]
                     for r in manifest["results"]
-                    if r.get("results") and "checks" in r["results"]]
+                    if isinstance(r.get("results"), dict) and
+                    kk in r["results"].get("checks", {})]
             ci = bootstrap_ci(vals, seed=hash(kk) % 1000)
             agg[kk] = ci
             print(f"  {kk:18s} {ci['mean']:.5f}  "
                   f"95% CI [{ci['lo']:.5f}, {ci['hi']:.5f}]  n={ci['n']}")
+        first_checks = next((r["results"]["checks"] for r in manifest["results"]
+                             if isinstance(r.get("results"), dict) and
+                             "checks" in r["results"] and
+                             all(k in r["results"]["checks"] for k in keys)), {})
+        limits = {k: first_checks[k]["limit"] for k in keys} if first_checks else {}
+        agg["gate_pass"] = bool(limits and all(
+            agg[k]["n"] == args.trials and np.isfinite(agg[k]["hi"]) and
+            agg[k]["hi"] <= limits[k] for k in keys))
+        print(f"\n  GATE 0 (aggregate): {'PASS' if agg['gate_pass'] else 'FAIL'}")
 
     manifest["aggregate"] = agg
     manifest["finished_unix"] = time.time()
     (out / "trials_manifest.json").write_text(
         json.dumps(manifest, indent=2, default=str))
     print(f"\nwritten to {out / 'trials_manifest.json'}")
-    return 0
+    rc = manifest_exit_code(manifest)
+    print(f"TRIAL DRIVER: {'PASS' if rc == 0 else 'FAIL'}")
+    return rc
 
 
 if __name__ == "__main__":

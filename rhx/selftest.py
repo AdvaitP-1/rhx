@@ -173,6 +173,66 @@ check("validator failures become publishability blockers",
       safe_v["publishable"] is False and bool(safe_v["blockers"]) and
       safe_v.get("validation_error", {}).get("type") == "RuntimeError")
 
+print("\n[9] trial driver exit status")
+with tempfile.TemporaryDirectory() as td:
+    manifest_path = Path(td) / "trials_manifest.json"
+
+    def manifest_rc(manifest):
+        manifest_path.write_text(json.dumps(manifest))
+        proc = subprocess.run(
+            [sys.executable, str(HERE / "run_trials.py"),
+             "--check-manifest", str(manifest_path)],
+            capture_output=True, text=True)
+        return proc.returncode
+
+    limits = {"frozen_abs_err": .05, "S_max_abs_err": .05,
+              "cv_rel_err": .15, "q50_rel_err": .20}
+    gate0 = {
+        "gate": 0, "trials": 1,
+        "results": [{"returncode": 0, "results": {
+            "gate0_pass": True,
+            "checks": {k: {"limit": v} for k, v in limits.items()}}}],
+        "aggregate": {**{k: {"n": 1, "hi": v / 2} for k, v in limits.items()},
+                      "gate_pass": True}}
+    gate1 = {
+        "gate": 1, "trials": 1,
+        "results": [{"returncode": 0, "results": {"gate1_pass": True}}],
+        "aggregate": {"ci": {"n": 1, "lo": .95}, "gate_pass": True}}
+    gate2 = {
+        "gate": 2, "trials": 3,
+        "results": [{"returncode": 0, "results": {
+            "gate2_pass": True,
+            "pass_criteria": {"homogeneous_amplification_max": 1.10,
+                              "heterogeneous_amplification_min": 1.30}}}
+            for _ in range(3)],
+        "aggregate": {"homogeneous": {"n": 3, "hi": 1.05},
+                      "heterogeneous": {"n": 3, "lo": 1.40},
+                      "paired_difference": {"n": 3, "lo": .20},
+                      "gate_pass": True}}
+
+    check("passing manifests exit successfully",
+          all(manifest_rc(m) == 0 for m in (gate0, gate1, gate2)))
+    failing_trial = json.loads(json.dumps(gate1))
+    failing_trial["results"][0]["returncode"] = 1
+    check("failed individual trial exits unsuccessfully",
+          manifest_rc(failing_trial) != 0)
+    failing_verdict = json.loads(json.dumps(gate1))
+    failing_verdict["aggregate"]["gate_pass"] = False
+    check("recorded aggregate failure exits unsuccessfully",
+          manifest_rc(failing_verdict) != 0)
+    failing_gate0 = json.loads(json.dumps(gate0))
+    failing_gate0["aggregate"]["frozen_abs_err"]["hi"] = .06
+    check("Gate 0 aggregate error exits unsuccessfully",
+          manifest_rc(failing_gate0) != 0)
+    failing_gate1 = json.loads(json.dumps(gate1))
+    failing_gate1["aggregate"]["ci"]["lo"] = .89
+    check("Gate 1 aggregate coverage exits unsuccessfully",
+          manifest_rc(failing_gate1) != 0)
+    failing_gate2 = json.loads(json.dumps(gate2))
+    failing_gate2["aggregate"]["heterogeneous"]["lo"] = 1.29
+    check("Gate 2 aggregate amplification exits unsuccessfully",
+          manifest_rc(failing_gate2) != 0)
+
 print("\n" + "=" * 70)
 print(f"PASS {P}   FAIL {F}   SKIP {SK}")
 print("=" * 70)
